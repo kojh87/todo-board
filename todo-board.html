@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>할 일 관리</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #ffffff;
+    --bg2: #f5f5f3;
+    --bg3: #efefec;
+    --text: #1a1a18;
+    --text2: #5a5a56;
+    --text3: #9a9a94;
+    --border: rgba(0,0,0,0.12);
+    --border2: rgba(0,0,0,0.2);
+    --radius: 8px;
+    --radius-lg: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1a;
+      --bg2: #252523;
+      --bg3: #2e2e2b;
+      --text: #f0f0ec;
+      --text2: #a8a8a0;
+      --text3: #686860;
+      --border: rgba(255,255,255,0.1);
+      --border2: rgba(255,255,255,0.18);
+    }
+  }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg3); color: var(--text); min-height: 100vh; }
+  input, select, textarea, button { font-family: inherit; }
+  button { cursor: pointer; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+/* ── 인메모리 storage 폴백 (파일로 열 때 window.storage 없을 수 있음) ── */
+if (!window.storage) {
+  const _mem = {};
+  window.storage = {
+    get: async (k) => _mem[k] ? { key: k, value: _mem[k] } : null,
+    set: async (k, v) => { _mem[k] = v; return { key: k, value: v }; },
+    delete: async (k) => { delete _mem[k]; return { key: k, deleted: true }; },
+    list: async (prefix) => ({ keys: Object.keys(_mem).filter(k => !prefix || k.startsWith(prefix)) }),
+  };
+  /* localStorage 브릿지 (로컬 파일/일반 브라우저 환경) */
+  try {
+    window.storage.get = async (k) => {
+      const v = localStorage.getItem(k);
+      return v ? { key: k, value: v } : null;
+    };
+    window.storage.set = async (k, v) => {
+      localStorage.setItem(k, v);
+      return { key: k, value: v };
+    };
+    window.storage.delete = async (k) => {
+      localStorage.removeItem(k);
+      return { key: k, deleted: true };
+    };
+    window.storage.list = async (prefix) => {
+      const keys = Object.keys(localStorage).filter(k => !prefix || k.startsWith(prefix));
+      return { keys };
+    };
+  } catch(e) { /* localStorage 없으면 인메모리 유지 */ }
+}
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+const S = {
+  blue:   { bg:"#E6F1FB", text:"#0C447C", border:"#85B7EB", dot:"#378ADD" },
+  purple: { bg:"#EEEDFE", text:"#3C3489", border:"#AFA9EC", dot:"#7F77DD" },
+  green:  { bg:"#EAF3DE", text:"#27500A", border:"#97C459", dot:"#639922" },
+  amber:  { bg:"#FAEEDA", text:"#633806", border:"#EF9F27", dot:"#BA7517" },
+  slate:  { bg:"#F1EFE8", text:"#444441", border:"#B4B2A9", dot:"#888780" },
+  rose:   { bg:"#FBEAF0", text:"#72243E", border:"#ED93B1", dot:"#D4537E" },
+  teal:   { bg:"#E1F5EE", text:"#085041", border:"#5DCAA5", dot:"#1D9E75" },
+  orange: { bg:"#FAECE7", text:"#712B13", border:"#F0997B", dot:"#D85A30" },
+};
+
+const DEFAULT_DOMAINS = [
+  { id:"d1", name:"상품",     color:"blue"   },
+  { id:"d2", name:"전시",     color:"purple" },
+  { id:"d3", name:"배송",     color:"green"  },
+  { id:"d4", name:"가격",     color:"amber"  },
+  { id:"d5", name:"테이블·DB",color:"slate"  },
+  { id:"d6", name:"회의·협업",color:"rose"   },
+];
+const DEFAULT_DONE_TYPES = [
+  {id:"dt1",name:"기획"},{id:"dt2",name:"테이블"},
+  {id:"dt3",name:"배포"},{id:"dt4",name:"회의"},
+];
+const PRIORITIES = {
+  high:   { label:"높음", color:"#E24B4A" },
+  normal: { label:"보통", color:"#BA7517" },
+  low:    { label:"낮음", color:"#B4B2A9" },
+};
+const COLUMNS   = [{key:"todo",label:"할 일"},{key:"doing",label:"진행 중"},{key:"done",label:"완료"}];
+const COL_KEYS  = ["todo","doing","done"];
+const STATUS_ORDER = {doing:0, todo:1, done:2};
+
+const uid       = () => Math.random().toString(36).slice(2,9);
+const todayStr  = () => new Date().toLocaleDateString("sv-SE");
+const defaultOtType = d => { const w=new Date(d).getDay(); return(w===0||w===6)?"holiday":"weekday"; };
+
+function bumpDate(dateStr, recurring) {
+  const base = dateStr ? new Date(dateStr) : new Date();
+  if (recurring==="daily")  base.setDate(base.getDate()+1);
+  if (recurring==="weekly") base.setDate(base.getDate()+7);
+  return base.toLocaleDateString("sv-SE");
+}
+function dueMeta(dateStr) {
+  if (!dateStr) return null;
+  const diff = Math.round((new Date(dateStr)-new Date(todayStr()))/86400000);
+  if (diff<0)  return {color:"#A32D2D",bg:"#FCEBEB",label:`${Math.abs(diff)}일 지남`};
+  if (diff===0) return {color:"#854F0B",bg:"#FAEEDA",label:"오늘"};
+  if (diff<=3)  return {color:"#854F0B",bg:"#FAEEDA",label:`${diff}일 후`};
+  return {color:"#888780",bg:"#F1EFE8",label:dateStr.slice(5).replace("-","/")};
+}
+function fmtDate(dateStr) {
+  const d  = new Date(dateStr);
+  const wd = ["일","월","화","수","목","금","토"][d.getDay()];
+  const lbl = dateStr===todayStr()?" 오늘":"";
+  return `${parseInt(dateStr.slice(5,7))}월 ${parseInt(dateStr.slice(8,10))}일 (${wd})${lbl}`;
+}
+
+const STORE_KEY   = "todo-board-v1";
+const SEED_BATCH  = "seed-batch-1";
+const SEED_ITEMS  = [
+  {title:"상세분류 핵심 속성 추출 요청 회의 (AI/ML팀 + 호섭님)", domain:"d6"},
+  {title:"테이블 확인 (VMI배송)",                                   domain:"d5"},
+  {title:"배송 L/T 관련 정리",                                      domain:"d3"},
+];
+const SEED2_BATCH = "seed-batch-2";
+const SEED2 = [
+  {c:"d2",title:"서브원픽 뱃지 이미지 반영 필요",             status:"todo"},
+  {c:"d2",title:"폐쇄몰 전환 관련 추가 기획",                 status:"todo"},
+  {c:"d1",title:"그룹상품 옵션수 늘리는 방향 검토",           status:"todo"},
+  {c:"d1",title:"[배포] 그룹상품 이미지 누락건 반영",         status:"done",done:"2026-06-01"},
+  {c:"d1",title:"고객노출상품명 자동로직 검토 필요",           status:"todo"},
+  {c:"d3",title:"배송 L/T 표현방법 정리",                     status:"doing"},
+  {c:"d4",title:"SSP 유효기간 확인 (동빈님)",                  status:"done",done:"2026-06-01"},
+  {c:"d4",title:"배송료 관련 카트 개발 내용 정리 필요",        status:"todo"},
+  {c:"d5",title:"배송유형 (VMI 추가)",                         status:"todo"},
+  {c:"d5",title:"KC인증여부 관련 테이블 확인",                 status:"todo"},
+];
+
+/* ═══════════════════════════ APP ═══════════════════════════ */
+function App() {
+  const [tasks,      setTasks]      = useState([]);
+  const [domains,    setDomains]    = useState(DEFAULT_DOMAINS);
+  const [doneTypes,  setDoneTypes]  = useState(DEFAULT_DONE_TYPES);
+  const [log,        setLog]        = useState([]);
+  const [overtime,   setOvertime]   = useState([]);
+  const [seeds,      setSeeds]      = useState([]);
+  const [loaded,     setLoaded]     = useState(false);
+  const [view,       setView]       = useState("list");
+  const [editing,    setEditing]    = useState(null);
+  const [completing, setCompleting] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [dragId,     setDragId]     = useState(null);
+  const [dragOver,   setDragOver]   = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      let data = { tasks:[], domains:DEFAULT_DOMAINS, doneTypes:DEFAULT_DONE_TYPES, log:[], overtime:[], seeds:[] };
+      try {
+        const r = await window.storage.get(STORE_KEY);
+        if (r && r.value) {
+          const d = JSON.parse(r.value);
+          data = { tasks:d.tasks||[], domains:d.domains||DEFAULT_DOMAINS, doneTypes:d.doneTypes||DEFAULT_DONE_TYPES, log:d.log||[], overtime:d.overtime||[], seeds:d.seeds||[] };
+        }
+      } catch(e) {}
+
+      if (!data.seeds.includes(SEED_BATCH)) {
+        const today=todayStr(), at=[], al=[];
+        SEED_ITEMS.forEach(s => {
+          const dom=data.domains.find(d=>d.id===s.domain), id=uid();
+          at.push({id,title:s.title,domain:s.domain,priority:"normal",dueDate:"",recurring:"none",checklist:[],status:"done",createdAt:today,completedAt:today});
+          al.push({id:uid(),taskId:id,date:today,title:s.title,domain:dom?dom.name:null,color:dom?dom.color:null,ts:Date.now()});
+        });
+        data.tasks=[...data.tasks,...at]; data.log=[...al,...data.log]; data.seeds=[...data.seeds,SEED_BATCH];
+      }
+      if (!data.seeds.includes(SEED2_BATCH)) {
+        const at=[], al=[];
+        SEED2.forEach(s => {
+          const dom=data.domains.find(d=>d.id===s.c), id=uid();
+          at.push({id,title:s.title,domain:s.c,priority:"normal",dueDate:"",recurring:"none",checklist:[],status:s.status,createdAt:"2026-06-01",completedAt:s.status==="done"?s.done:null});
+          if (s.status==="done") al.push({id:uid(),taskId:id,date:s.done,title:s.title,domain:dom?dom.name:null,color:dom?dom.color:null,ts:Date.now()});
+        });
+        data.tasks=[...data.tasks,...at]; data.log=[...data.log,...al]; data.seeds=[...data.seeds,SEED2_BATCH];
+      }
+      if (!data.seeds.includes("dt-meeting")) {
+        if (!data.doneTypes.some(t=>t.name==="회의")) data.doneTypes=[...data.doneTypes,{id:uid(),name:"회의"}];
+        data.seeds=[...data.seeds,"dt-meeting"];
+      }
+      setTasks(data.tasks); setDomains(data.domains); setDoneTypes(data.doneTypes);
+      setLog(data.log); setOvertime(data.overtime); setSeeds(data.seeds);
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      try { await window.storage.set(STORE_KEY, JSON.stringify({tasks,domains,doneTypes,log,overtime,seeds})); }
+      catch(e) { console.error(e); }
+    })();
+  }, [tasks,domains,doneTypes,log,overtime,seeds,loaded]);
+
+  const domainById = id => domains.find(d=>d.id===id);
+
+  function saveTask(data) {
+    if (data.id) {
+      const prev = tasks.find(t=>t.id===data.id);
+      setTasks(ts=>ts.map(t=>t.id===data.id?{...t,...data}:t));
+      const dom = domains.find(d=>d.id===data.domain);
+      const dateChanged = prev&&data.status==="done"&&data.completedAt&&prev.completedAt!==data.completedAt;
+      setLog(l=>l.map(e=>{
+        if (e.taskId!==data.id) return e;
+        const upd={...e,title:data.title,domain:dom?dom.name:null,color:dom?dom.color:null,doneType:data.completedType!==undefined?data.completedType:e.doneType};
+        if (dateChanged&&e.date===prev.completedAt) upd.date=data.completedAt;
+        return upd;
+      }));
+    } else {
+      setTasks(ts=>[...ts,{...data,id:uid(),status:"todo",createdAt:todayStr()}]);
+    }
+    setEditing(null);
+  }
+
+  function removeTask(id) {
+    setTasks(ts=>ts.filter(t=>t.id!==id).map(t=>t.related?{...t,related:t.related.filter(r=>r!==id)}:t));
+    setLog(l=>l.filter(e=>e.taskId!==id));
+    setEditing(null);
+  }
+
+  function openLogEntry(e) {
+    let t = tasks.find(x=>x.id===e.taskId) || tasks.find(x=>x.status==="done"&&x.title===e.title&&x.completedAt===e.date) || tasks.find(x=>x.title===e.title);
+    if (t) { if (e.taskId!==t.id) setLog(l=>l.map(x=>x.id===e.id?{...x,taskId:t.id}:x)); setEditing(t); return; }
+    const dom=domains.find(d=>d.name===e.domain), id=uid();
+    const nt={id,title:e.title,detail:"",domain:dom?dom.id:domains[0]?.id,priority:"normal",dueDate:"",requestDate:"",recurring:"none",checklist:[],related:[],status:"done",completedAt:e.date,createdAt:e.date,completedType:e.doneType||null};
+    setTasks(ts=>[...ts,nt]); setLog(l=>l.map(x=>x.id===e.id?{...x,taskId:id}:x)); setEditing(nt);
+  }
+
+  function setTaskStatus(id, newStatus, doneType) {
+    const today=todayStr();
+    setTasks(ts=>{
+      const t=ts.find(x=>x.id===id); if (!t||t.status===newStatus) return ts;
+      if (t.status==="done"&&newStatus!=="done") {
+        setLog(l=>l.filter(e=>!(e.taskId===id&&e.date===today)));
+        return ts.map(x=>x.id===id?{...x,status:newStatus,completedAt:null,completedType:null}:x);
+      }
+      if (newStatus==="done") {
+        const dom=domainById(t.domain);
+        setLog(l=>[{id:uid(),taskId:id,date:today,title:t.title,domain:dom?dom.name:null,color:dom?dom.color:null,doneType:doneType||null,ts:Date.now()},...l]);
+        if (t.recurring&&t.recurring!=="none") {
+          return ts.map(x=>x.id===id?{...x,status:"todo",completedAt:null,completedType:null,dueDate:bumpDate(x.dueDate,x.recurring),checklist:(x.checklist||[]).map(c=>({...c,done:false}))}:x);
+        }
+        return ts.map(x=>x.id===id?{...x,status:"done",completedAt:today,completedType:doneType||null}:x);
+      }
+      return ts.map(x=>x.id===id?{...x,status:newStatus}:x);
+    });
+  }
+  function requestComplete(id) { setCompleting(id); }
+  function completeWith(typeName) { if(completing) setTaskStatus(completing,"done",typeName); setCompleting(null); }
+  function toggleCheck(taskId,cid) { setTasks(ts=>ts.map(t=>t.id===taskId?{...t,checklist:t.checklist.map(c=>c.id===cid?{...c,done:!c.done}:c)}:t)); }
+
+  if (!loaded) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:"var(--text2)",fontSize:14}}>불러오는 중…</div>;
+
+  const TABS=[{key:"list",label:"리스트",icon:"ti-list"},{key:"board",label:"보드",icon:"ti-layout-columns"},{key:"log",label:"기록",icon:"ti-clipboard-list"},{key:"ot",label:"초과근무",icon:"ti-clock"}];
+
+  return (
+    <div style={{minHeight:"100vh",color:"var(--text)"}}>
+      {/* 상단 네비 */}
+      <div style={{background:"var(--bg)",borderBottom:"0.5px solid var(--border)",position:"sticky",top:0,zIndex:50,padding:"0 20px"}}>
+        <div style={{maxWidth:920,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"space-between",height:52}}>
+          <span style={{fontSize:15,fontWeight:500,letterSpacing:"-0.01em"}}>📋 할 일 관리</span>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{display:"flex",background:"var(--bg2)",borderRadius:8,padding:2}}>
+              {TABS.map(t=>{const on=view===t.key; return(
+                <button key={t.key} onClick={()=>setView(t.key)} style={{display:"flex",alignItems:"center",gap:4,padding:"5px 10px",borderRadius:6,border:"none",fontSize:13,fontWeight:on?500:400,cursor:"pointer",background:on?"var(--bg)":"transparent",color:on?"var(--text)":"var(--text2)",boxShadow:on?"0 1px 3px rgba(0,0,0,0.08)":"none",transition:"all 0.15s"}}>
+                  <i className={`ti ${t.icon}`} aria-hidden="true" style={{fontSize:13}} /><span>{t.label}</span>
+                </button>
+              );})}
+            </div>
+            <button onClick={()=>setShowSettings(true)} style={{background:"transparent",border:"none",cursor:"pointer",padding:6,color:"var(--text2)",fontSize:18,display:"flex",borderRadius:6}} title="설정"><i className="ti ti-settings" /></button>
+          </div>
+        </div>
+      </div>
+
+      {/* 본문 */}
+      <div style={{maxWidth:920,margin:"0 auto",padding:"24px 20px 60px"}}>
+        {view==="list"  && <ListView tasks={tasks} domains={domains} onCheck={(id,done)=>done?requestComplete(id):setTaskStatus(id,"todo")} onToggleSub={toggleCheck} onEdit={setEditing} onAdd={catId=>setEditing({domain:catId})} />}
+        {view==="board" && <BoardView tasks={tasks} domains={domains} domainById={domainById} onEdit={setEditing} onAdd={()=>setEditing("new")} onToggle={toggleCheck} move={setTaskStatus} onComplete={requestComplete} dragId={dragId} setDragId={setDragId} dragOver={dragOver} setDragOver={setDragOver} />}
+        {view==="log"   && <DailyLog log={log} tasks={tasks} onEdit={openLogEntry} />}
+        {view==="ot"    && <Overtime entries={overtime} setEntries={setOvertime} />}
+      </div>
+
+      {editing    && <TaskEditor task={editing==="new"?null:editing} domains={domains} doneTypes={doneTypes} setDoneTypes={setDoneTypes} allTasks={tasks} onSave={saveTask} onDelete={removeTask} onOpenTask={t=>setEditing(t)} onClose={()=>setEditing(null)} />}
+      {completing && <CompleteTypeModal types={doneTypes} setTypes={setDoneTypes} onPick={completeWith} onClose={()=>setCompleting(null)} />}
+      {showSettings && <SettingsPanel domains={domains} setDomains={setDomains} doneTypes={doneTypes} setDoneTypes={setDoneTypes} onClose={()=>setShowSettings(false)} />}
+    </div>
+  );
+}
+
+/* ═══════════════════════════ LIST VIEW ═══════════════════════════ */
+function ListView({tasks,domains,onCheck,onToggleSub,onEdit,onAdd}) {
+  const today   = todayStr();
+  const visible = tasks.filter(t=>t.status!=="done"||t.completedAt===today);
+  const groups  = domains.map(d=>({d,items:visible.filter(t=>t.domain===d.id).sort((a,b)=>STATUS_ORDER[a.status]-STATUS_ORDER[b.status])})).filter(g=>g.items.length>0);
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+        <p style={{fontSize:12,color:"var(--text3)"}}>완료 항목은 오늘만 표시돼요. 지난 완료는 기록 탭에서.</p>
+        <button onClick={()=>onAdd(domains[0]?.id)} style={{display:"flex",alignItems:"center",gap:5,background:"var(--text)",color:"var(--bg)",border:"none",borderRadius:8,padding:"6px 14px",fontSize:13,fontWeight:500,cursor:"pointer"}}>
+          <i className="ti ti-plus" aria-hidden="true" style={{fontSize:13}} /> 할 일 추가
+        </button>
+      </div>
+      {groups.length===0 && <div style={{textAlign:"center",padding:"80px 0",fontSize:13,color:"var(--text3)"}}>할 일이 없어요. "할 일 추가"로 시작해보세요.</div>}
+      <div style={{display:"flex",flexDirection:"column",gap:22}}>
+        {groups.map(({d,items})=>{
+          const c=S[d.color];
+          return (
+            <div key={d.id}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                <span style={{width:7,height:7,borderRadius:"50%",background:c.dot,flexShrink:0}} />
+                <span style={{fontSize:13,fontWeight:500}}>{d.name}</span>
+                <span style={{fontSize:12,color:"var(--text3)"}}>{items.length}</span>
+              </div>
+              <div style={{paddingLeft:4}}>
+                {items.map(t=>{
+                  const done=t.status==="done", due=dueMeta(t.dueDate);
+                  return (
+                    <div key={t.id}>
+                      <div style={{display:"flex",alignItems:"flex-start",gap:8,padding:"5px 8px",borderRadius:6}} onMouseEnter={e=>e.currentTarget.style.background="var(--bg2)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <button onClick={()=>onCheck(t.id,!done)} style={{width:15,height:15,borderRadius:4,border:`1.5px solid ${done?"var(--text)":"var(--border2)"}`,background:done?"var(--text)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:2,cursor:"pointer"}}>
+                          {done && <i className="ti ti-check" style={{fontSize:9,color:"var(--bg)"}} />}
+                        </button>
+                        <div style={{flex:1,cursor:"pointer"}} onClick={()=>onEdit(t)}>
+                          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                            {!done&&t.priority==="high"&&<span style={{width:6,height:6,borderRadius:"50%",background:"#E24B4A",flexShrink:0}} />}
+                            <span style={{fontSize:13,lineHeight:1.5,textDecoration:done?"line-through":"none",color:done?"var(--text3)":"var(--text)"}}>{t.title}</span>
+                            {t.status==="doing"&&<span style={{fontSize:11,fontWeight:500,color:"#3C3489",background:"#EEEDFE",padding:"1px 6px",borderRadius:4}}>진행중</span>}
+                            {due&&!done&&<span style={{fontSize:11,fontWeight:500,color:due.color,background:due.bg,padding:"1px 6px",borderRadius:4}}>{due.label}</span>}
+                          </div>
+                        </div>
+                      </div>
+                      {(t.checklist||[]).length>0&&(
+                        <div style={{paddingLeft:28}}>
+                          {t.checklist.map(s=>(
+                            <button key={s.id} onClick={()=>onToggleSub(t.id,s.id)} style={{display:"flex",alignItems:"center",gap:7,padding:"2px 8px",borderRadius:4,background:"transparent",border:"none",cursor:"pointer",width:"100%",textAlign:"left"}}>
+                              <span style={{width:12,height:12,borderRadius:3,border:`1.5px solid ${s.done?"#888":"var(--border2)"}`,background:s.done?"#888":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                                {s.done&&<i className="ti ti-check" style={{fontSize:8,color:"#fff"}} />}
+                              </span>
+                              <span style={{fontSize:12,color:s.done?"var(--text3)":"var(--text2)",textDecoration:s.done?"line-through":"none"}}>{s.text}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════ BOARD VIEW ═══════════════════════════ */
+function BoardView({tasks,domains,domainById,onEdit,onAdd,move,onComplete,dragId,setDragId,dragOver,setDragOver}) {
+  const [filterDomain,setFilterDomain] = useState("all");
+  const [doneDate,setDoneDate]         = useState(todayStr());
+  const today = todayStr();
+  const shiftDoneDate = n => { const d=new Date(doneDate); d.setDate(d.getDate()+n); setDoneDate(d.toLocaleDateString("sv-SE")); };
+
+  function moveCard(taskId, currentStatus, direction) {
+    const idx=COL_KEYS.indexOf(currentStatus), nextIdx=idx+direction;
+    if (nextIdx<0||nextIdx>=COL_KEYS.length) return;
+    const next=COL_KEYS[nextIdx];
+    if (next==="done") onComplete(taskId); else move(taskId,next);
+  }
+
+  const filtered = tasks.filter(t=>filterDomain==="all"||t.domain===filterDomain);
+  const colItems = key => key==="done" ? filtered.filter(t=>t.status==="done"&&t.completedAt===doneDate) : filtered.filter(t=>t.status===key);
+
+  return (
+    <>
+      <div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:6,marginBottom:16}}>
+        <button onClick={()=>setFilterDomain("all")} style={{padding:"4px 10px",borderRadius:20,border:`0.5px solid ${filterDomain==="all"?"var(--text)":"var(--border)"}`,background:filterDomain==="all"?"var(--text)":"transparent",color:filterDomain==="all"?"var(--bg)":"var(--text2)",fontSize:12,fontWeight:500,cursor:"pointer"}}>전체</button>
+        {domains.map(d=>{const c=S[d.color],on=filterDomain===d.id;return(
+          <button key={d.id} onClick={()=>setFilterDomain(on?"all":d.id)} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 10px",borderRadius:20,border:`0.5px solid ${on?c.border:"var(--border)"}`,background:on?c.bg:"transparent",color:on?c.text:"var(--text2)",fontSize:12,fontWeight:500,cursor:"pointer"}}>
+            <span style={{width:6,height:6,borderRadius:"50%",background:c.dot}} />{d.name}
+          </button>
+        );})}
+        <button onClick={onAdd} style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:5,background:"var(--text)",color:"var(--bg)",border:"none",borderRadius:8,padding:"6px 14px",fontSize:13,fontWeight:500,cursor:"pointer"}}>
+          <i className="ti ti-plus" aria-hidden="true" style={{fontSize:13}} /> 할 일 추가
+        </button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,minmax(0,1fr))",gap:12}}>
+        {COLUMNS.map(col=>{
+          const items=colItems(col.key);
+          return (
+            <div key={col.key}
+              onDragOver={e=>{e.preventDefault();setDragOver(col.key);}}
+              onDragLeave={()=>setDragOver(o=>o===col.key?null:o)}
+              onDrop={()=>{if(dragId){if(col.key==="done")onComplete(dragId);else move(dragId,col.key);}setDragId(null);setDragOver(null);}}
+              style={{borderRadius:10,padding:10,background:dragOver===col.key?"var(--bg3)":"var(--bg2)",border:"0.5px solid var(--border)",transition:"background 0.15s"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 2px",marginBottom:10}}>
+                {col.key==="done"?(
+                  <div style={{display:"flex",alignItems:"center",gap:2}}>
+                    <span style={{fontSize:13,fontWeight:500,color:"var(--text2)"}}>완료</span>
+                    <button onClick={()=>shiftDoneDate(-1)} style={{width:18,height:18,display:"flex",alignItems:"center",justifyContent:"center",border:"none",background:"transparent",cursor:"pointer",color:"var(--text3)",fontSize:14}}>‹</button>
+                    <span style={{fontSize:11,color:doneDate===today?"var(--text3)":"var(--text2)",fontWeight:doneDate===today?400:500}}>{doneDate===today?"오늘":fmtDate(doneDate).replace(" 오늘","")}</span>
+                    <button onClick={()=>shiftDoneDate(1)} disabled={doneDate>=today} style={{width:18,height:18,display:"flex",alignItems:"center",justifyContent:"center",border:"none",background:"transparent",cursor:"pointer",color:"var(--text3)",fontSize:14,opacity:doneDate>=today?0.3:1}}>›</button>
+                  </div>
+                ):(
+                  <span style={{fontSize:13,fontWeight:500,color:"var(--text2)"}}>{col.label}</span>
+                )}
+                <span style={{fontSize:11,color:"var(--text3)",background:"var(--bg)",borderRadius:10,padding:"1px 8px",border:"0.5px solid var(--border)"}}>{items.length}</span>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:6,minHeight:60}}>
+                {items.map(t=>(
+                  <TaskCard key={t.id} task={t} domain={domainById(t.domain)} colKey={col.key}
+                    onClick={()=>onEdit(t)} onMove={dir=>moveCard(t.id,col.key,dir)}
+                    onDragStart={()=>setDragId(t.id)} onDragEnd={()=>{setDragId(null);setDragOver(null);}} />
+                ))}
+                {items.length===0&&<div style={{textAlign:"center",fontSize:12,color:"var(--text3)",padding:"20px 0"}}>비어 있음</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+function TaskCard({task,domain,colKey,onClick,onMove,onDragStart,onDragEnd}) {
+  const [hovered,setHovered] = useState(false);
+  const idx=COL_KEYS.indexOf(colKey), canLeft=idx>0, canRight=idx<COL_KEYS.length-1;
+  const c=domain?S[domain.color]:null, p=PRIORITIES[task.priority]||PRIORITIES.normal;
+  const due=dueMeta(task.dueDate), checks=task.checklist||[], doneCount=checks.filter(x=>x.done).length;
+  return (
+    <div draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
+      onMouseEnter={()=>setHovered(true)} onMouseLeave={()=>setHovered(false)}
+      style={{background:"var(--bg)",borderRadius:8,border:`0.5px solid ${hovered?"var(--border2)":"var(--border)"}`,padding:"8px 10px",cursor:"default",transition:"border-color 0.15s"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <span style={{width:6,height:6,borderRadius:"50%",background:p.color,flexShrink:0}} />
+        <p onClick={onClick} title={task.title} style={{fontSize:13,lineHeight:1.4,flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:task.status==="done"?"var(--text3)":"var(--text)",textDecoration:task.status==="done"?"line-through":"none",cursor:"pointer"}}>{task.title}</p>
+        <div style={{display:"flex",alignItems:"center",gap:2,opacity:hovered?1:0,transition:"opacity 0.15s",flexShrink:0}}>
+          <button onClick={e=>{e.stopPropagation();onMove(-1);}} disabled={!canLeft} title="왼쪽으로 이동"
+            style={{width:20,height:20,display:"flex",alignItems:"center",justifyContent:"center",border:"0.5px solid var(--border2)",borderRadius:4,background:"var(--bg2)",cursor:canLeft?"pointer":"default",color:"var(--text2)",opacity:canLeft?1:0.25,fontSize:12}}>
+            <i className="ti ti-chevron-left" aria-hidden="true" />
+          </button>
+          <button onClick={e=>{e.stopPropagation();onMove(1);}} disabled={!canRight} title="오른쪽으로 이동"
+            style={{width:20,height:20,display:"flex",alignItems:"center",justifyContent:"center",border:"0.5px solid var(--border2)",borderRadius:4,background:"var(--bg2)",cursor:canRight?"pointer":"default",color:"var(--text2)",opacity:canRight?1:0.25,fontSize:12}}>
+            <i className="ti ti-chevron-right" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      {(due||checks.length>0||c)&&(
+        <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6,paddingLeft:12}}>
+          {due&&<span style={{fontSize:11,fontWeight:500,color:due.color,background:due.bg,padding:"1px 6px",borderRadius:4}}>{due.label}</span>}
+          {checks.length>0&&<span style={{fontSize:11,color:"var(--text3)",background:"var(--bg2)",padding:"1px 6px",borderRadius:4,border:"0.5px solid var(--border)"}}>{doneCount}/{checks.length}</span>}
+          {c&&domain&&<span style={{fontSize:11,fontWeight:500,color:c.text,background:c.bg,padding:"1px 6px",borderRadius:4}}>{domain.name}</span>}
+          {task.completedType&&<span style={{fontSize:11,color:"var(--text2)",border:"0.5px solid var(--border)",padding:"1px 6px",borderRadius:4}}>{task.completedType}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════ COMPLETE TYPE MODAL ═══════════════════════════ */
+function CompleteTypeModal({types,setTypes,onPick,onClose}) {
+  const [manage,setManage]=useState(false), [newName,setNewName]=useState("");
+  const addType=()=>{if(!newName.trim())return;setTypes(d=>[...d,{id:uid(),name:newName.trim()}]);setNewName("");};
+  return (
+    <Overlay onClose={onClose}>
+      <Modal width={300}>
+        <ModalHeader title={manage?"완료 타입 관리":"완료 타입 선택"} sub={manage?"타입을 추가·수정·삭제하세요.":"어떤 작업으로 완료했나요?"} onClose={onClose} extra={<button onClick={()=>setManage(m=>!m)} style={{fontSize:12,color:"var(--text3)",background:"none",border:"none",cursor:"pointer"}}>{manage?"완료":"관리"}</button>} />
+        <div style={{padding:12,display:"flex",flexDirection:"column",gap:6}}>
+          {!manage?(
+            <>
+              {types.map(t=><button key={t.id} onClick={()=>onPick(t.name)} style={{width:"100%",textAlign:"left",padding:"8px 12px",borderRadius:8,border:"0.5px solid var(--border)",fontSize:13,color:"var(--text)",background:"transparent",cursor:"pointer"}} onMouseEnter={e=>e.currentTarget.style.background="var(--bg2)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>{t.name}</button>)}
+              {types.length===0&&<p style={{fontSize:12,color:"var(--text3)",textAlign:"center",padding:"8px 0"}}>"관리"에서 완료 타입을 추가하세요.</p>}
+              <button onClick={()=>onPick(null)} style={{width:"100%",textAlign:"center",padding:6,fontSize:12,color:"var(--text3)",background:"none",border:"none",cursor:"pointer"}}>타입 없이 완료</button>
+            </>
+          ):(
+            <>
+              {types.map(t=>(
+                <div key={t.id} style={{display:"flex",gap:6}}>
+                  <input value={t.name} onChange={e=>setTypes(ds=>ds.map(x=>x.id===t.id?{...x,name:e.target.value}:x))} style={iS()} />
+                  <IBtn icon="ti-trash" onClick={()=>setTypes(ds=>ds.filter(x=>x.id!==t.id))} />
+                </div>
+              ))}
+              <div style={{display:"flex",gap:6,marginTop:4}}>
+                <input value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")addType();}} placeholder="새 완료 타입" style={iS()} />
+                <PlusBtn onClick={addType} />
+              </div>
+            </>
+          )}
+        </div>
+      </Modal>
+    </Overlay>
+  );
+}
+
+/* ═══════════════════════════ TASK EDITOR ═══════════════════════════ */
+function TaskEditor({task,domains,doneTypes,setDoneTypes,allTasks,onSave,onDelete,onOpenTask,onClose}) {
+  const isNew=!task?.id, done=task?.status==="done";
+  const [title,         setTitle]         = useState(task?.title||"");
+  const [detail,        setDetail]        = useState(task?.detail||"");
+  const [domain,        setDomain]        = useState(task?.domain||(domains[0]?.id||""));
+  const [priority,      setPriority]      = useState(task?.priority||"normal");
+  const [dueDate,       setDueDate]       = useState(task?.dueDate||"");
+  const [requestDate,   setRequestDate]   = useState(task?.requestDate||"");
+  const [checklist,     setChecklist]     = useState(task?.checklist||[]);
+  const [related,       setRelated]       = useState(task?.related||[]);
+  const [completedDate, setCompletedDate] = useState(task?.completedAt||todayStr());
+  const [completedType, setCompletedType] = useState(task?.completedType||null);
+  const [newItem,       setNewItem]       = useState("");
+  const [aiLoading,     setAiLoading]     = useState(false);
+  const [aiResult,      setAiResult]      = useState(null);
+  const [aiError,       setAiError]       = useState(null);
+
+  const addItem=()=>{if(!newItem.trim())return;setChecklist(c=>[...c,{id:uid(),text:newItem.trim(),done:false}]);setNewItem("");};
+
+  async function aiReview() {
+    if (!detail.trim()||aiLoading) return;
+    setAiLoading(true); setAiResult(null); setAiError(null);
+    try {
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:`다음은 업무 할 일의 "상세 내용" 메모입니다. 제목은 "${title||"(제목 없음)"}". 문맥과 의도를 유지하면서 더 명확하고 읽기 쉽게 다듬어주세요. 한국어 업무 문체로 간결하게, 불필요한 머리말 없이 본문만 출력하세요.\n\n---\n${detail}`}]})});
+      const data=await res.json();
+      const text=(data.content||[]).filter(i=>i.type==="text").map(i=>i.text).join("\n").trim();
+      if (text) setAiResult(text); else setAiError("결과를 받지 못했어요.");
+    } catch(e) { setAiError("오류가 발생했어요."); }
+    finally { setAiLoading(false); }
+  }
+
+  function submit() {
+    if (!title.trim()) return;
+    onSave({id:task?.id,title:title.trim(),detail:detail.trim(),domain,priority,dueDate,requestDate,recurring:task?.recurring||"none",checklist,related,status:task?.status,createdAt:task?.createdAt,completedAt:done?completedDate:task?.completedAt,completedType:done?completedType:task?.completedType});
+  }
+
+  const relatableTasks=allTasks.filter(x=>x.id!==task?.id&&!related.includes(x.id));
+
+  return (
+    <Overlay onClose={onClose}>
+      <Modal width={680} tall>
+        <ModalHeader title={isNew?"새 할 일":"할 일 수정"} onClose={onClose} />
+        <div style={{padding:18,overflowY:"auto",flex:1}}>
+          <div style={{display:"flex",gap:0}}>
+            {/* LEFT */}
+            <div style={{width:"60%",paddingRight:16,display:"flex",flexDirection:"column",gap:14}}>
+              <input autoFocus value={title} onChange={e=>setTitle(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")submit();}}
+                placeholder="무엇을 해야 하나요?" style={{width:"100%",fontSize:15,border:"none",borderBottom:"2px solid var(--border)",padding:"4px 0",background:"transparent",color:"var(--text)",outline:"none"}} />
+              <div>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                  <label style={lbl()}>상세 내용</label>
+                  <button onClick={aiReview} disabled={!detail.trim()||aiLoading} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,fontWeight:500,color:"#3C3489",background:"#EEEDFE",border:"0.5px solid #AFA9EC",borderRadius:6,padding:"3px 8px",cursor:"pointer",opacity:(!detail.trim()||aiLoading)?0.4:1}}>
+                    <i className="ti ti-sparkles" style={{fontSize:11}} />{aiLoading?"검토 중…":"AI 검토"}
+                  </button>
+                </div>
+                <textarea value={detail} onChange={e=>setDetail(e.target.value)} rows={4} placeholder="배경, 참고사항, 진행 메모 등" style={{...iS(),resize:"vertical",lineHeight:1.6}} />
+                {aiError&&<p style={{fontSize:11,color:"#A32D2D",marginTop:4}}>{aiError}</p>}
+                {aiResult&&(
+                  <div style={{marginTop:8,border:"0.5px solid #AFA9EC",background:"#EEEDFE",borderRadius:8,padding:10}}>
+                    <div style={{fontSize:11,fontWeight:500,color:"#3C3489",marginBottom:6,display:"flex",alignItems:"center",gap:4}}><i className="ti ti-sparkles" />AI 제안</div>
+                    <p style={{fontSize:13,color:"var(--text)",whiteSpace:"pre-wrap",lineHeight:1.6}}>{aiResult}</p>
+                    <div style={{display:"flex",gap:8,marginTop:8}}>
+                      <button onClick={()=>{setDetail(aiResult);setAiResult(null);}} style={{fontSize:12,fontWeight:500,background:"var(--text)",color:"var(--bg)",border:"none",borderRadius:6,padding:"5px 12px",cursor:"pointer"}}>적용</button>
+                      <button onClick={()=>setAiResult(null)} style={{fontSize:12,color:"var(--text2)",background:"none",border:"none",cursor:"pointer",padding:5}}>닫기</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div>
+                <label style={lbl()}>하위 항목</label>
+                <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:6}}>
+                  {checklist.map(c=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",gap:8}}>
+                      <button onClick={()=>setChecklist(cl=>cl.map(x=>x.id===c.id?{...x,done:!x.done}:x))} style={{width:14,height:14,borderRadius:3,border:`1.5px solid ${c.done?"#888":"var(--border2)"}`,background:c.done?"#888":"transparent",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0}}>
+                        {c.done&&<i className="ti ti-check" style={{fontSize:9,color:"#fff"}} />}
+                      </button>
+                      <span style={{flex:1,fontSize:13,color:c.done?"var(--text3)":"var(--text2)",textDecoration:c.done?"line-through":"none"}}>{c.text}</span>
+                      <IBtn icon="ti-x" onClick={()=>setChecklist(cl=>cl.filter(x=>x.id!==c.id))} />
+                    </div>
+                  ))}
+                </div>
+                <div style={{display:"flex",gap:6}}>
+                  <input value={newItem} onChange={e=>setNewItem(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")addItem();}} placeholder="하위 항목 추가" style={{...iS(),flex:1}} />
+                  <PlusBtn onClick={addItem} />
+                </div>
+              </div>
+              <div>
+                <label style={lbl()}>연관 할 일</label>
+                <select value="" onChange={e=>{if(e.target.value)setRelated(r=>[...r,e.target.value]);}} style={{...iS(),marginBottom:6}}>
+                  <option value="">+ 연관 할 일 추가</option>
+                  {relatableTasks.map(x=><option key={x.id} value={x.id}>{x.title}</option>)}
+                </select>
+                <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                  {related.map(rid=>{const rt=allTasks.find(x=>x.id===rid);return(
+                    <span key={rid} style={{display:"inline-flex",alignItems:"center",gap:4,fontSize:12,background:"var(--bg2)",color:"var(--text2)",padding:"2px 6px",borderRadius:6,border:"0.5px solid var(--border)"}}>
+                      {rt?rt.title.slice(0,18)+(rt.title.length>18?"…":""):"(삭제됨)"}
+                      <IBtn icon="ti-x" onClick={()=>setRelated(r=>r.filter(x=>x!==rid))} small />
+                    </span>
+                  );})}
+                </div>
+              </div>
+            </div>
+            {/* RIGHT */}
+            <div style={{width:"40%",borderLeft:"0.5px solid var(--border)",paddingLeft:16,display:"flex",flexDirection:"column",gap:14}}>
+              <div>
+                <label style={lbl()}>카테고리</label>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                  {domains.map(d=>{const c=S[d.color],on=domain===d.id;return(
+                    <button key={d.id} onClick={()=>setDomain(d.id)} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 8px",borderRadius:6,border:`0.5px solid ${on?c.border:"var(--border)"}`,background:on?c.bg:"transparent",color:on?c.text:"var(--text2)",fontSize:12,fontWeight:500,cursor:"pointer"}}>
+                      <span style={{width:5,height:5,borderRadius:"50%",background:c.dot}} />{d.name}
+                    </button>
+                  );})}
+                </div>
+              </div>
+              <div>
+                <label style={lbl()}>우선순위</label>
+                <div style={{display:"flex",gap:4}}>
+                  {Object.entries(PRIORITIES).map(([k,v])=>(
+                    <button key={k} onClick={()=>setPriority(k)} style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:4,padding:5,borderRadius:6,border:`0.5px solid ${priority===k?"var(--border2)":"var(--border)"}`,background:priority===k?"var(--bg2)":"transparent",fontSize:12,fontWeight:priority===k?500:400,color:"var(--text2)",cursor:"pointer"}}>
+                      <span style={{width:6,height:6,borderRadius:"50%",background:v.color}} />{v.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div><label style={lbl()}>요청일</label><input type="date" value={requestDate} onChange={e=>setRequestDate(e.target.value)} style={iS()} /></div>
+              <div><label style={lbl()}>마감일</label><input type="date" value={dueDate} onChange={e=>setDueDate(e.target.value)} style={iS()} /></div>
+              {done&&(
+                <>
+                  <div><label style={lbl()}>완료일</label><input type="date" value={completedDate} onChange={e=>setCompletedDate(e.target.value)} style={iS()} /></div>
+                  <div>
+                    <label style={lbl()}>완료 타입</label>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                      {doneTypes.map(dt=>(
+                        <button key={dt.id} onClick={()=>setCompletedType(completedType===dt.name?null:dt.name)} style={{padding:"4px 8px",borderRadius:6,fontSize:12,fontWeight:500,border:`0.5px solid ${completedType===dt.name?"var(--text)":"var(--border)"}`,background:completedType===dt.name?"var(--text)":"transparent",color:completedType===dt.name?"var(--bg)":"var(--text2)",cursor:"pointer"}}>{dt.name}</button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"12px 18px",borderTop:"0.5px solid var(--border)",background:"var(--bg)"}}>
+          {!isNew&&<button onClick={()=>onDelete(task.id)} style={{padding:8,borderRadius:6,background:"transparent",border:"none",cursor:"pointer",color:"var(--text3)",fontSize:18,display:"flex"}}><i className="ti ti-trash" /></button>}
+          <button onClick={submit} disabled={!title.trim()} style={{flex:1,background:"var(--text)",color:"var(--bg)",border:"none",borderRadius:8,padding:"10px",fontSize:14,fontWeight:500,cursor:"pointer",opacity:title.trim()?1:0.4}}>{isNew?"추가":"저장"}</button>
+        </div>
+      </Modal>
+    </Overlay>
+  );
+}
+
+/* ═══════════════════════════ DAILY LOG ═══════════════════════════ */
+function DailyLog({log,tasks,onEdit}) {
+  const weekStartOf=s=>{const d=new Date(s);const day=(d.getDay()+6)%7;d.setDate(d.getDate()-day);return d.toLocaleDateString("sv-SE");};
+  const shiftDays=(s,n)=>{const d=new Date(s);d.setDate(d.getDate()+n);return d.toLocaleDateString("sv-SE");};
+  const fmtMD=s=>`${parseInt(s.slice(5,7))}월 ${parseInt(s.slice(8,10))}일`;
+  const [mode,setMode]         = useState("date");
+  const [weekStart,setWeekStart] = useState(weekStartOf(todayStr()));
+  const [copied,setCopied]     = useState(false);
+  const weekEnd = shiftDays(weekStart,6);
+  const taskFor = e => tasks.find(x=>x.id===e.taskId);
+
+  const weekLog = useMemo(()=>{const we=shiftDays(weekStart,6);return log.filter(e=>e.date>=weekStart&&e.date<=we);},[log,weekStart]);
+  const byDate  = useMemo(()=>{const g={};weekLog.forEach(e=>{(g[e.date]=g[e.date]||[]).push(e);});return Object.entries(g).sort((a,b)=>a[0]<b[0]?1:-1);},[weekLog]);
+  const byCat   = useMemo(()=>{const g={};weekLog.forEach(e=>{const k=e.domain||"미분류";(g[k]=g[k]||[]).push(e);});return Object.entries(g).map(([cat,items])=>({cat,color:items[0]?items[0].color:null,count:items.length,items:[...items].sort((a,b)=>a.date<b.date?1:-1)})).sort((a,b)=>a.cat.localeCompare(b.cat));},[weekLog]);
+
+  const copyText=()=>{
+    const text=byCat.map(g=>[g.cat,...g.items.map(e=>`- ${e.title}`)].join("\n")).join("\n\n");
+    if (!text) return;
+    const done=()=>{setCopied(true);setTimeout(()=>setCopied(false),1500);};
+    try{navigator.clipboard.writeText(text).then(done,()=>{const ta=document.createElement("textarea");ta.value=text;ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);done();});}
+    catch(e){}
+  };
+
+  if (log.length===0) return <div style={{textAlign:"center",padding:"80px 0",fontSize:13,color:"var(--text3)"}}>완료한 일이 여기에 쌓여요.<br/><span style={{fontSize:12}}>리스트·보드에서 항목을 완료해보세요.</span></div>;
+
+  const row=(e,opts={})=>{
+    const c=e.color?S[e.color]:null, t=taskFor(e);
+    return (
+      <div key={e.id} onClick={()=>onEdit(e)} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",borderRadius:6,cursor:"pointer"}} onMouseEnter={el=>el.currentTarget.style.background="var(--bg2)"} onMouseLeave={el=>el.currentTarget.style.background="transparent"}>
+        <i className="ti ti-circle-check" style={{fontSize:13,color:"#639922",flexShrink:0}} />
+        {e.doneType&&<span style={{fontSize:11,fontWeight:500,color:"var(--text2)",border:"0.5px solid var(--border)",padding:"1px 5px",borderRadius:4,flexShrink:0}}>{e.doneType}</span>}
+        <span style={{fontSize:13,color:"var(--text2)",flex:1}}>{e.title}</span>
+        {t&&t.detail&&<span style={{fontSize:11,color:"var(--text3)",background:"var(--bg2)",padding:"1px 5px",borderRadius:4,flexShrink:0}}>메모</span>}
+        {opts.tag==="after"&&c&&<span style={{fontSize:11,fontWeight:500,color:c.text,background:c.bg,padding:"1px 6px",borderRadius:4,flexShrink:0}}>{e.domain}</span>}
+        {opts.showDate&&<span style={{fontSize:11,color:"var(--text3)",flexShrink:0,marginLeft:"auto"}}>{fmtDate(e.date).replace(" 오늘","")}</span>}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <div style={{display:"flex",background:"var(--bg2)",borderRadius:8,padding:2}}>
+          {["date","cat"].map(m=><button key={m} onClick={()=>setMode(m)} style={{padding:"4px 12px",borderRadius:6,border:"none",fontSize:12,fontWeight:500,cursor:"pointer",background:mode===m?"var(--bg)":"transparent",color:mode===m?"var(--text)":"var(--text2)"}}>{m==="date"?"일자별":"카테고리별"}</button>)}
+        </div>
+        <button onClick={copyText} disabled={weekLog.length===0} style={{display:"flex",alignItems:"center",gap:4,fontSize:12,color:"var(--text2)",border:"0.5px solid var(--border)",borderRadius:6,padding:"4px 10px",background:"transparent",cursor:"pointer",opacity:weekLog.length===0?0.4:1}}>
+          <i className="ti ti-copy" style={{fontSize:12}} />{copied?"복사됨":"복사"}
+        </button>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:20,background:"var(--bg2)",borderRadius:8,padding:"6px 10px",width:"fit-content"}}>
+        <button onClick={()=>setWeekStart(shiftDays(weekStart,-7))} style={{width:22,height:22,display:"flex",alignItems:"center",justifyContent:"center",border:"none",background:"transparent",cursor:"pointer",color:"var(--text3)",fontSize:15}}>‹</button>
+        <span style={{fontSize:13,fontWeight:500,padding:"0 4px"}}>{fmtMD(weekStart)} ~ {fmtMD(weekEnd)}</span>
+        <button onClick={()=>setWeekStart(shiftDays(weekStart,7))} style={{width:22,height:22,display:"flex",alignItems:"center",justifyContent:"center",border:"none",background:"transparent",cursor:"pointer",color:"var(--text3)",fontSize:15}}>›</button>
+        <span style={{fontSize:12,color:"var(--text3)"}}>{weekLog.length}건</span>
+        {weekStart!==weekStartOf(todayStr())&&<button onClick={()=>setWeekStart(weekStartOf(todayStr()))} style={{fontSize:11,color:"var(--text3)",background:"none",border:"none",cursor:"pointer",marginLeft:4}}>이번 주</button>}
+      </div>
+      {weekLog.length===0?<div style={{textAlign:"center",padding:"40px 0",fontSize:13,color:"var(--text3)"}}>이 주에는 완료 기록이 없어요.</div>:
+      mode==="date"?(
+        <div style={{display:"flex",flexDirection:"column",gap:24}}>
+          {byDate.map(([date,items])=>(
+            <div key={date} style={{display:"flex",gap:16}}>
+              <div style={{width:80,flexShrink:0,paddingTop:2}}><p style={{fontSize:12,fontWeight:500,color:"var(--text2)"}}>{fmtDate(date)}</p><p style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{items.length}건</p></div>
+              <div style={{flex:1,borderLeft:"2px solid var(--border)",paddingLeft:14}}>{items.map(e=>row(e,{tag:"after"}))}</div>
+            </div>
+          ))}
+        </div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:20}}>
+          {byCat.map(grp=>{const c=grp.color?S[grp.color]:null;return(
+            <div key={grp.cat}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                <span style={{width:7,height:7,borderRadius:"50%",background:c?c.dot:"#B4B2A9"}} />
+                <span style={{fontSize:13,fontWeight:500}}>{grp.cat}</span>
+                <span style={{fontSize:12,color:"var(--text3)"}}>{grp.count}건</span>
+              </div>
+              <div style={{paddingLeft:14,borderLeft:"2px solid var(--border)"}}>{grp.items.map(e=>row(e,{tag:"none",showDate:true}))}</div>
+            </div>
+          );})}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════ OVERTIME ═══════════════════════════ */
+function Overtime({entries,setEntries}) {
+  const startDefault=t=>t==="weekday"?"17:30":"";
+  const [date,setDate]   = useState(todayStr());
+  const [type,setType]   = useState(defaultOtType(todayStr()));
+  const [start,setStart] = useState(startDefault(defaultOtType(todayStr())));
+  const [end,setEnd]     = useState("");
+  const [note,setNote]   = useState("");
+  const [month,setMonth] = useState(todayStr().slice(0,7));
+  const [editId,setEditId] = useState(null);
+
+  const TIME_OPTIONS=[];
+  for(let h=0;h<24;h++) for(const m of[0,30]) TIME_OPTIONS.push(`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`);
+
+  const fmtTime   = total=>{const m=(((total%1440)+1440)%1440);return`${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`;};
+  const addToTime = (t,mins)=>t?fmtTime(parseInt(t.slice(0,2))*60+parseInt(t.slice(3,5))+mins):"";
+  const handleStart=v=>{setStart(v);if(!editId)setEnd(v);};
+  const calcHours=(s,e2)=>{if(!s||!e2)return 0;const[sh,sm]=s.split(":").map(Number);const[eh,em]=e2.split(":").map(Number);let diff=(eh*60+em)-(sh*60+sm);if(diff<=0)diff+=1440;return Math.round((diff/60)*100)/100;};
+  const liveHours=calcHours(start,end);
+  const fmtH=n=>Number.isInteger(n)?n:n.toFixed(1);
+
+  function changeDate(v){const t=defaultOtType(v);setDate(v);setType(t);if(!editId)setStart(startDefault(t));}
+  function resetForm(){const t=defaultOtType(todayStr());setEditId(null);setDate(todayStr());setType(t);setStart(startDefault(t));setEnd("");setNote("");}
+  function save(){if(!date||!start||!end||liveHours<=0)return;if(editId){setEntries(arr=>arr.map(x=>x.id===editId?{...x,date,type,start,end,hours:liveHours,note:note.trim()}:x));}else{setEntries(e=>[{id:uid(),date,type,start,end,hours:liveHours,note:note.trim()},...e]);}resetForm();}
+  function startEdit(en){setEditId(en.id);setDate(en.date);setType(en.type);setStart(en.start||"");setEnd(en.end||"");setNote(en.note||"");}
+
+  const monthEntries=useMemo(()=>entries.filter(e=>e.date.startsWith(month)).sort((a,b)=>a.date<b.date?1:-1),[entries,month]);
+  const total=monthEntries.reduce((s,e)=>s+e.hours,0);
+  const wk=monthEntries.filter(e=>e.type==="weekday").reduce((s,e)=>s+e.hours,0);
+  const hol=monthEntries.filter(e=>e.type==="holiday").reduce((s,e)=>s+e.hours,0);
+
+  return (
+    <div>
+      <div style={{background:editId?"#FAEEDA":"var(--bg2)",borderRadius:10,padding:14,marginBottom:16,border:editId?"0.5px solid #EF9F27":"0.5px solid var(--border)"}}>
+        {editId&&<p style={{fontSize:12,fontWeight:500,color:"#633806",marginBottom:10}}>기록 수정 중</p>}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div><label style={lbl()}>날짜</label><input type="date" value={date} onChange={e=>changeDate(e.target.value)} style={iS()} /></div>
+          <div><label style={lbl()}>구분</label>
+            <div style={{display:"flex",gap:4}}>{[["weekday","평일"],["holiday","휴일"]].map(([k,l])=><button key={k} onClick={()=>{setType(k);if(!editId)setStart(startDefault(k));}} style={{flex:1,padding:6,borderRadius:6,border:`0.5px solid ${type===k?"var(--text)":"var(--border)"}`,background:type===k?"var(--text)":undefined,color:type===k?"var(--bg)":"var(--text2)",fontSize:12,fontWeight:500,cursor:"pointer"}}>{l}</button>)}</div>
+          </div>
+          <div><label style={lbl()}>시작</label><select value={start} onChange={e=>handleStart(e.target.value)} style={iS()}><option value="">--:--</option>{TIME_OPTIONS.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
+          <div><label style={lbl()}>종료</label><select value={end} onChange={e=>setEnd(e.target.value)} style={iS()}><option value="">--:--</option>{TIME_OPTIONS.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
+          <div style={{gridColumn:"1/-1"}}><label style={lbl()}>메모 (선택)</label><input value={note} onChange={e=>setNote(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")save();}} placeholder="업무 내용" style={iS()} /></div>
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:4,marginTop:10}}>
+          <span style={{fontSize:11,color:"var(--text3)"}}>빠른 설정</span>
+          {[["+30분",30],["+1시간",60],["+2시간",120],["+3시간",180]].map(([l,mins])=><button key={l} onClick={()=>start&&setEnd(addToTime(end||start,mins))} disabled={!start} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"0.5px solid var(--border)",background:"var(--bg)",color:"var(--text2)",cursor:"pointer",opacity:start?1:0.4}}>{l}</button>)}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginTop:10}}>
+          <button onClick={save} disabled={!start||!end||liveHours<=0} style={{flex:1,background:"var(--text)",color:"var(--bg)",border:"none",borderRadius:8,padding:"8px",fontSize:13,fontWeight:500,cursor:"pointer",opacity:(start&&end&&liveHours>0)?1:0.4}}>{editId?"수정 저장":"기록 추가"}</button>
+          {editId&&<button onClick={resetForm} style={{fontSize:13,color:"var(--text2)",background:"none",border:"none",cursor:"pointer"}}>취소</button>}
+          {start&&end&&<span style={{fontSize:13,color:"var(--text2)",whiteSpace:"nowrap"}}>→ <strong style={{color:"var(--text)"}}>{fmtH(liveHours)}시간</strong></span>}
+        </div>
+      </div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <input type="month" value={month} onChange={e=>setMonth(e.target.value)} style={{padding:"5px 8px",borderRadius:6,border:"0.5px solid var(--border)",fontSize:13,background:"var(--bg)",color:"var(--text)"}} />
+        <span style={{fontSize:12,color:"var(--text3)"}}>{monthEntries.length}일 근무</span>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+        <div style={{background:"var(--text)",color:"var(--bg)",borderRadius:10,padding:"12px 14px"}}><p style={{fontSize:12,opacity:0.6}}>이번 달 합계</p><p style={{fontSize:22,fontWeight:500,marginTop:4}}>{fmtH(total)}<span style={{fontSize:13,fontWeight:400}}>h</span></p></div>
+        <div style={{background:"#E6F1FB",borderRadius:10,padding:"12px 14px"}}><p style={{fontSize:12,color:"#185FA5"}}>평일</p><p style={{fontSize:22,fontWeight:500,color:"#0C447C",marginTop:4}}>{fmtH(wk)}<span style={{fontSize:13,fontWeight:400}}>h</span></p></div>
+        <div style={{background:"#FBEAF0",borderRadius:10,padding:"12px 14px"}}><p style={{fontSize:12,color:"#993556"}}>휴일</p><p style={{fontSize:22,fontWeight:500,color:"#72243E",marginTop:4}}>{fmtH(hol)}<span style={{fontSize:13,fontWeight:400}}>h</span></p></div>
+      </div>
+      {monthEntries.length===0?<div style={{textAlign:"center",padding:"40px 0",fontSize:13,color:"var(--text3)"}}>이 달의 초과근무 기록이 없어요.</div>:(
+        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+          {monthEntries.map(e=>(
+            <div key={e.id} onClick={()=>startEdit(e)} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",borderRadius:8,cursor:"pointer",background:e.id===editId?"#FAEEDA":"transparent"}} onMouseEnter={el=>el.currentTarget.style.background=e.id===editId?"#FAEEDA":"var(--bg2)"} onMouseLeave={el=>el.currentTarget.style.background=e.id===editId?"#FAEEDA":"transparent"}>
+              <span style={{fontSize:12,color:"var(--text2)",width:72,flexShrink:0}}>{fmtDate(e.date).replace(" 오늘","")}</span>
+              <span style={{fontSize:11,fontWeight:500,padding:"1px 6px",borderRadius:4,background:e.type==="holiday"?"#FBEAF0":"#E6F1FB",color:e.type==="holiday"?"#72243E":"#0C447C",flexShrink:0}}>{e.type==="holiday"?"휴일":"평일"}</span>
+              <span style={{fontSize:12,color:"var(--text3)",width:90,flexShrink:0}}>{e.start&&e.end?`${e.start}~${e.end}`:""}</span>
+              <span style={{fontSize:13,fontWeight:500,width:36,flexShrink:0}}>{fmtH(e.hours)}h</span>
+              <span style={{fontSize:13,color:"var(--text2)",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.note}</span>
+              <button onClick={ev=>{ev.stopPropagation();setEntries(arr=>arr.filter(x=>x.id!==e.id));if(editId===e.id)resetForm();}} style={{opacity:0,background:"none",border:"none",cursor:"pointer",color:"#E24B4A",fontSize:14,display:"flex"}} onMouseEnter={el=>el.currentTarget.style.opacity=1} onMouseLeave={el=>el.currentTarget.style.opacity=0}><i className="ti ti-trash" /></button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════ SETTINGS ═══════════════════════════ */
+function SettingsPanel({domains,setDomains,doneTypes,setDoneTypes,onClose}) {
+  const COLOR_KEYS=Object.keys(S);
+  const [name,setName]=useState(""), [color,setColor]=useState("blue"), [typeName,setTypeName]=useState("");
+  const add=()=>{if(!name.trim())return;setDomains(d=>[...d,{id:uid(),name:name.trim(),color}]);setName("");};
+  const addType=()=>{if(!typeName.trim())return;setDoneTypes(d=>[...d,{id:uid(),name:typeName.trim()}]);setTypeName("");};
+  return (
+    <Overlay onClose={onClose} bottom>
+      <Modal width={460} bottom>
+        <ModalHeader title="설정" onClose={onClose} />
+        <div style={{padding:18,overflowY:"auto",maxHeight:"70vh",display:"flex",flexDirection:"column",gap:24}}>
+          <div>
+            <h3 style={{fontSize:13,fontWeight:500,marginBottom:10}}>카테고리</h3>
+            <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:12}}>
+              {domains.map(d=>{const c=S[d.color];return(
+                <div key={d.id} style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{width:7,height:7,borderRadius:"50%",background:c.dot,flexShrink:0}} />
+                  <span style={{flex:1,fontSize:13,fontWeight:500,color:c.text,background:c.bg,padding:"3px 8px",borderRadius:6}}>{d.name}</span>
+                  <div style={{display:"flex",gap:3}}>{COLOR_KEYS.map(k=><button key={k} onClick={()=>setDomains(ds=>ds.map(x=>x.id===d.id?{...x,color:k}:x))} style={{width:14,height:14,borderRadius:"50%",background:S[k].dot,border:d.color===k?"2px solid var(--text)":"2px solid transparent",cursor:"pointer"}} />)}</div>
+                  <IBtn icon="ti-trash" onClick={()=>setDomains(ds=>ds.filter(x=>x.id!==d.id))} />
+                </div>
+              );})}
+            </div>
+            <div style={{display:"flex",gap:6}}><input value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")add();}} placeholder="새 카테고리 이름" style={{...iS(),flex:1}} /><PlusBtn onClick={add} /></div>
+            <div style={{display:"flex",gap:4,marginTop:8}}>{COLOR_KEYS.map(k=><button key={k} onClick={()=>setColor(k)} style={{width:16,height:16,borderRadius:"50%",background:S[k].dot,border:color===k?"2px solid var(--text)":"2px solid transparent",cursor:"pointer"}} />)}</div>
+          </div>
+          <div style={{borderTop:"0.5px solid var(--border)",paddingTop:16}}>
+            <h3 style={{fontSize:13,fontWeight:500,marginBottom:4}}>완료 타입</h3>
+            <p style={{fontSize:12,color:"var(--text3)",marginBottom:10}}>할 일 완료 시 선택하는 작업 유형이에요.</p>
+            <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:10}}>
+              {doneTypes.map(dt=>(
+                <div key={dt.id} style={{display:"flex",gap:6}}>
+                  <input value={dt.name} onChange={e=>setDoneTypes(ds=>ds.map(x=>x.id===dt.id?{...x,name:e.target.value}:x))} style={{...iS(),flex:1}} />
+                  <IBtn icon="ti-trash" onClick={()=>setDoneTypes(ds=>ds.filter(x=>x.id!==dt.id))} />
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:6}}><input value={typeName} onChange={e=>setTypeName(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")addType();}} placeholder="새 완료 타입 (예: QA, 운영)" style={{...iS(),flex:1}} /><PlusBtn onClick={addType} /></div>
+          </div>
+        </div>
+      </Modal>
+    </Overlay>
+  );
+}
+
+/* ═══════════════════════════ 공통 컴포넌트 ═══════════════════════════ */
+function Overlay({onClose,children,bottom}) {
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.35)",display:"flex",alignItems:bottom?"flex-end":"center",justifyContent:"center",zIndex:200,padding:bottom?0:16}} onClick={onClose}>
+      {children}
+    </div>
+  );
+}
+function Modal({width,tall,bottom,children}) {
+  return (
+    <div style={{background:"var(--bg)",width:"100%",maxWidth:width,borderRadius:bottom?"16px 16px 0 0":"16px",boxShadow:"0 8px 32px rgba(0,0,0,0.15)",border:"0.5px solid var(--border2)",display:"flex",flexDirection:"column",maxHeight:tall?"90vh":undefined,overflow:"hidden"}} onClick={e=>e.stopPropagation()}>
+      {children}
+    </div>
+  );
+}
+function ModalHeader({title,sub,onClose,extra}) {
+  return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 18px",borderBottom:"0.5px solid var(--border)",flexShrink:0}}>
+      <div>{sub?<><div style={{fontSize:14,fontWeight:500}}>{title}</div><div style={{fontSize:12,color:"var(--text3)",marginTop:2}}>{sub}</div></>:<span style={{fontSize:15,fontWeight:500}}>{title}</span>}</div>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {extra}
+        <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text2)",fontSize:20,display:"flex"}}><i className="ti ti-x" /></button>
+      </div>
+    </div>
+  );
+}
+const iS  = () => ({width:"100%",padding:"6px 10px",borderRadius:6,border:"0.5px solid var(--border2)",fontSize:13,background:"var(--bg)",color:"var(--text)"});
+const lbl = () => ({fontSize:12,color:"var(--text3)",display:"block",marginBottom:6});
+function IBtn({icon,onClick,small}) {
+  return <button onClick={onClick} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text3)",fontSize:small?12:16,display:"flex",alignItems:"center",padding:2}}><i className={`ti ${icon}`} /></button>;
+}
+function PlusBtn({onClick}) {
+  return <button onClick={onClick} style={{padding:"6px 12px",borderRadius:6,background:"var(--text)",color:"var(--bg)",border:"none",cursor:"pointer",fontSize:15,display:"flex",alignItems:"center"}}><i className="ti ti-plus" /></button>;
+}
+
+/* ═══════════════════════════ MOUNT ═══════════════════════════ */
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
